@@ -1,6 +1,9 @@
 import functools as ft
 import itertools as it
-from time import time, sleep
+from time import time
+
+import networkx as nx
+import numpy as np
 
 
 def timing(f):
@@ -17,8 +20,6 @@ def timing(f):
 
 @timing
 def library_solution(nodes):
-    import networkx as nx
-
     edges = [
         (u, v, sum((x1 - x2) * (x1 - x2) for x1, x2 in zip(u, v)))
         for u, v in list(it.combinations(nodes, 2))
@@ -35,8 +36,6 @@ def library_solution(nodes):
 
 @timing
 def numpy_solution(nodes):
-    import numpy as np
-
     n = len(nodes)
     infty = np.iinfo(np.int64).max
     labels = np.arange(n)
