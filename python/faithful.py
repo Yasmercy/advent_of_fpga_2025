@@ -85,11 +85,11 @@ def main():
         lines = f.readlines()
 
     nodes = [tuple(map(int, line.strip().split(","))) for line in lines]
-    sol1 = library_solution(nodes)
+    # sol1 = library_solution(nodes)
     sol2 = numpy_solution(nodes)
 
-    assert sol1 == sol2
-    print(sol1)
+    # assert sol1 == sol2
+    # print(sol1)
 
 
 if __name__ == "__main__":

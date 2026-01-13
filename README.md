@@ -11,6 +11,8 @@ The main algorithmic complexity for this problem is a minimum spanning tree (MST
 Both parts can be easily solved once you find the MST of the vertices in Euclidean space.
 In particular, part2 is simply to find the longest edge in the MST and return the product of x coordinates.
 
+Note that I am assuming that all edge weights are distinct (so that the MST is unique).
+
 First, I designed an implementation inspired by the P-RAM model.
 The standard P-RAM model allows for concurrent reads and exclusive writes (CREW).
 
@@ -37,6 +39,8 @@ The main data structure is just an array of the component ids for each vertex.
 Finding the shortest edge exiting a component is embarassingly parallel, and is simply taking the min of O(n^2) edges.
 With only n processors, this takes O(n + logn) = O(n) time to do the reduction.
 Merging the component identifiers is much more interesting.
+
+The more "faithful" implementation is in faithful.py, while a faster optimized version is in unfaithful.py
 
 ### Naive method
 
@@ -118,6 +122,10 @@ Recall that we are proceeding with the star contraction strategy.
 First, I need to hash the component ids to determine the heads and tails.
 Then, for each vertex that goes from a tail->head, I update the component id to that of the tail's.
 
+### Pseudorandom generation
+
+TODO
+
 ### Analysis
 
 Reading the input takes O(n) time (~125 cycles).
@@ -142,21 +150,35 @@ Of course, there are many ways to improve the software (as I am doing a lot of r
 ## Hardware Parallelism
 
 TODO; make sure this synthesizes.
+TODO; evaluate the number of cycles it takes on my input.
 
-# Further Improvements to Contractions
+# Further Improvements
+
+## Contractions (once again)
 
 The star contractions was partly chosen for simplicity (avoiding a sequential dependency chain).
 Instead, sequentially merging ALL of the edges would more than halve the number of iterations!
 
-The problem here is the requirement of pointer chasing.
-For example, suppose we use up-trees (where each component has a representative and the other vertices point to a parent).
-Then, merging two components is again as easy as finding the representatives doing one updating the parents.
+There are several problems here.
 
-The height of this tree is now logarithmic in the height (no longer constant).
-To do path compression, after each phase we would set parent[u] = parent[parent[u]].
-This is pointer chasing, and seems to be slow and difficult (accessing the parent array concurrently for 1000 reads is slow!)
+First is that we don't know how long the dependency chain is.
+As described above, for a chain (merging 2 into 1, 3 into 2, 4 into 3, ...) a naive implementation will take O(n) iterations!
+However, there is significant advantage to doing so (as the time for a phase is completely dominated by the distance finding).
 
-The best solution I theory-crafted was to duplicate the parent array, say 8 times and spend say 64 cycles doing the reads.
-Then, with at most 10 phases, we would more than halve the total number of cycles needed.
+Testing this in software, even the above naive implementation (of repeating the contraction along the edge until it converges) only takes at most 5 iterations per phase.
+Moreover, it cut the software runtime by about a half.
 
-^ TODO; implement and benchmark this; compare area requirements, ...
+Now, let us explore the results in the hardware simulation.
+TODO
+
+## Shortest Outgoing Edges
+
+The bottleneck is in the reduction to find the minimum outgoing edge for each vertex.
+The conceptually simplest way to improve this is to do this minimum outgoing edge *per component*, so each further step becomes faster and faster (with less and less components).
+
+I did not have time to explore this in more detail.
+
+## The Geometry of Euclidean Space
+
+Here, the only place I used the Euclidean MST was in avoiding the O(n^2) cost of storing an adjacency list.
+There are many more optimizations to do in Euclidean space, many of which can be seen in [Prokopenko et al](https://dl.acm.org/doi/fullHtml/10.1145/3545008.3546185).
