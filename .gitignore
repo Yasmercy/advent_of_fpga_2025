@@ -1,0 +1,15 @@
+*
+!**/
+
+!.gitignore
+!README.md
+
+!**/.ocamlformat
+!**/dune*
+**/_build
+
+!**/*.ml
+!**/*.py
+
+!data/*
+data/input.in
