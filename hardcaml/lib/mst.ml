@@ -3,36 +3,23 @@ open Hardcaml
 open Signal
 open Hardcaml_waveterm
 
-module Distance = struct
-  let width = 18
+let width = 18
 
-  module I = struct
-    type 'a t = { p1 : 'a; [@bits 3 * width] p2 : 'a [@bits 3 * width] }
-    [@@deriving sexp_of, hardcaml]
-  end
-
-  module O = struct
-    type 'a t = { dist : 'a [@bits 2 * width] }
-  end
-
+let dist p1 p2 =
   let unpack p =
     let z = select p (width - 1) 0 in
     let y = select p ((2 * width) - 1) width in
     let x = select p ((3 * width) - 1) (2 * width) in
     (x, y, z)
-
-  let create (inputs : _ I.t) =
-    let x1, y1, z1 = unpack inputs.p1 in
-    let x2, y2, z2 = unpack inputs.p2 in
-    let dx = sresize (x1 -: x2) (2 * width) in
-    let dy = sresize (y1 -: y2) (2 * width) in
-    let dz = sresize (z1 -: z2) (2 * width) in
-    let dist = (dx *: dx) +: (dy *: dy) +: (dz *: dz) in
-    { O.dist }
-end
+  in
+  let x1, y1, z1 = unpack p1 in
+  let x2, y2, z2 = unpack p2 in
+  let dx = sresize (x1 -: x2) (2 * width) in
+  let dy = sresize (y1 -: y2) (2 * width) in
+  let dz = sresize (z1 -: z2) (2 * width) in
+  (dx *: dx) +: (dy *: dy) +: (dz *: dz)
 
 module MinimumSpanningTree = struct
-  let width = 18
   let mem_width = 10
   (* let mem_depth = 1000 *)
 
@@ -59,12 +46,12 @@ module MinimumSpanningTree = struct
   end
 
   let create (inputs : _ I.t) =
-    let mem1_waddr = Bits.of_int ~width:mem_width 0 in
-    let mem1_wdata = Bits.of_int ~width:(3 * mem_width) 0 in
-    let mem1_we = Bits.of_int ~width:(3 * mem_width) 0 in
-    let mem2_waddr = Bits.of_int ~width:mem_width 0 in
-    let mem2_wdata = Bits.of_int ~width:(3 * mem_width) 0 in
-    let mem2_we = Bits.of_int ~width:(3 * mem_width) 0 in
+    let mem1_waddr = Signal.of_int ~width:mem_width 0 in
+    let mem1_wdata = Signal.of_int ~width:(3 * width) 0 in
+    let mem1_we = Signal.of_int ~width:1 0 in
+    let mem2_waddr = Signal.of_int ~width:mem_width 0 in
+    let mem2_wdata = Signal.of_int ~width:(3 * width) 0 in
+    let mem2_we = Signal.of_int ~width:1 0 in
     {
       O.mem1_waddr;
       O.mem1_wdata;
@@ -75,6 +62,17 @@ module MinimumSpanningTree = struct
     }
 end
 
+let%expect_test "l2 dist" =
+  let make_point x y z =
+    let p = x + Int.shift_left y width + Int.shift_left z (2 * width) in
+    Signal.of_int ~width:(3 * width) p
+  in
+  let p1 = make_point 162 817 812 in
+  let p2 = make_point 57 618 57 in
+  let d = dist p1 p2 in
+  Printf.printf "%d\n" (Signal.to_int d);
+  [%expect {| 620651 |}]
+
 let%expect_test "test" =
   let testbench () =
     let module Sim =
@@ -84,7 +82,9 @@ let%expect_test "test" =
 
     let inputs = Cyclesim.inputs sim in
     inputs.clk := Bits.vdd;
-
-    Printf.printf "%d\n" (Bits.to_int !(inputs.clk))
+    inputs.clr := Bits.vdd;
+    inputs.input_done := Bits.vdd;
+    inputs.mem_rdata := Bits.zero (3 * width)
+    (* Printf.printf "%d\n" (Bits.to_int !(inputs.clk)) *)
   in
   testbench ()
