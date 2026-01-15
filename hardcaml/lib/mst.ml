@@ -94,6 +94,30 @@ module MinimumSpanningTree = struct
           Signal.reg spec ~enable (Signal.of_int ~width:lg_nodes idx))
     in
 
+    (* stage 2: *)
+    let reduced =
+      let combine prev i j =
+        let same_component = components.(i) ==: components.(j) in
+        let smaller = distances.(j) <: distances.(i) in
+        Signal.mux2 (smaller &: same_component) prev.(i) prev.(j)
+      in
+      let rec loop stage prev =
+        if stage = lg_nodes then prev
+        else
+          let stride = 1 lsl stage in
+          let next =
+            Array.init nodes ~f:(fun i ->
+                let j = (i + stride) % nodes in
+                let combined = combine prev i j in
+                Signal.reg spec combined)
+          in
+          loop (stage + 1) next
+      in
+      loop 0 nearest
+    in
+
+    (* stage 3: *)
+    (* TODO: star contractions *)
     let mem1_waddr = Signal.of_int ~width:lg_nodes 0 in
     let mem1_wdata = Signal.of_int ~width:(3 * width) 0 in
     let mem1_we = Signal.of_int ~width:1 0 in
