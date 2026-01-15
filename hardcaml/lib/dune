@@ -1,5 +1,5 @@
 (library
- (libraries base hardcaml hardcaml_waveterm)
+ (libraries base hardcaml hardcaml_waveterm hardcaml_circuits)
  (inline_tests)
  (preprocess
   (pps ppx_jane ppx_hardcaml ppx_inline_test))

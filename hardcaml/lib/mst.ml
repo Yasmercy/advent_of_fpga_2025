@@ -3,10 +3,11 @@ open Core
 open Hardcaml
 open Signal
 open Hardcaml_waveterm
+open Hardcaml_circuits
 
 let width = 18
 
-let dist p1 p2 =
+let distance p1 p2 =
   let unpack p =
     let z = select p (width - 1) 0 in
     let y = select p ((2 * width) - 1) width in
@@ -19,6 +20,12 @@ let dist p1 p2 =
   let dy = sresize (y1 -: y2) (2 * width) in
   let dz = sresize (z1 -: z2) (2 * width) in
   (dx *: dx) +: (dy *: dy) +: (dz *: dz)
+
+let prng component seed =
+  let lfsr state = Lfsr.create (module Signal) state in
+  let s1 = lfsr component in
+  let s2 = lfsr seed in
+  Signal.to_bool (s1 ^: s2)
 
 module MinimumSpanningTree = struct
   let lg_nodes = 10
@@ -53,10 +60,11 @@ module MinimumSpanningTree = struct
     let clk = inputs.clk in
     let clr = inputs.clr in
     let spec = Reg_spec.create ~clear:clr ~clock:clk () in
+    let seed = reg_fb spec ~enable:vdd ~width ~f:(fun x -> x +:. 1) in
 
     let start = inputs.input_done &: ~:clr in
     let c_spec = Reg_spec.create ~clear:~:start ~clock:clk () in
-    let cycles = reg_fb c_spec ~enable:vdd ~width:20 ~f:(fun x -> x +:. 1) in
+    let cycles = reg_fb c_spec ~enable:vdd ~width ~f:(fun x -> x +:. 1) in
 
     let stage0 = ~:start in
     let stage1 = cycles <=:. nodes in
@@ -71,27 +79,27 @@ module MinimumSpanningTree = struct
     in
 
     (* stage 1: *)
-    let current_idx =
-      Signal.to_int (Signal.mux2 stage0 cycles (Signal.zero lg_nodes))
-    in
+    let current_idx = Signal.mux2 stage0 cycles (Signal.zero lg_nodes) in
 
-    let components =
-      Array.init nodes ~f:(fun idx ->
-          let enable = Signal.vdd in
-          Signal.reg spec ~enable (Signal.of_int ~width:lg_nodes idx))
-    in
+    let component_wires = Array.init nodes ~f:(fun _ -> Signal.wire lg_nodes) in
+    let components = Array.init nodes ~f:(fun idx -> component_wires.(idx)) in
 
-    let distances =
-      Array.init nodes ~f:(fun _ -> Signal.of_int ~width:lg_nodes (-1))
-    in
+    let dist_wires = Array.init nodes ~f:(fun _ -> Signal.wire (2 * width)) in
+    let distances = Array.init nodes ~f:(fun idx -> dist_wires.(idx)) in
+
     let nearest =
       Array.init nodes ~f:(fun idx ->
-          let outgoing = components.(idx) <>: components.(current_idx) in
-          let distance = dist positions.(idx) positions.(current_idx) in
-          let shorter = distance <: distances.(idx) in
+          let cur_idx = Signal.to_int current_idx in
+          let outgoing = components.(idx) <>: components.(cur_idx) in
+          let dist = distance positions.(idx) positions.(cur_idx) in
+          let shorter = dist <: distances.(idx) in
           let enable = stage1 &: outgoing &: shorter in
 
-          Signal.reg spec ~enable (Signal.of_int ~width:lg_nodes idx))
+          let uninit = dist_wires.(idx) <>:. 0 in
+          let new_dist = mux2 (uninit |: enable) dist_wires.(idx) dist in
+          Signal.assign dist_wires.(idx) new_dist;
+
+          Signal.reg spec ~enable current_idx)
     in
 
     (* stage 2: *)
@@ -117,7 +125,20 @@ module MinimumSpanningTree = struct
     in
 
     (* stage 3: *)
-    (* TODO: star contractions *)
+    let rec contract idx =
+      if idx = nodes then ()
+      else
+        let flip_me = prng components.(idx) seed in
+        let flip_other = prng reduced.(idx) seed in
+
+        if flip_me && not flip_other then
+          Signal.assign component_wires.(idx) reduced.(idx);
+
+        contract (idx + 1)
+    in
+    contract 0;
+
+    (* TODO: input reading and output writing *)
     let mem1_waddr = Signal.of_int ~width:lg_nodes 0 in
     let mem1_wdata = Signal.of_int ~width:(3 * width) 0 in
     let mem1_we = Signal.of_int ~width:1 0 in
@@ -141,7 +162,7 @@ let%expect_test "l2 dist" =
   in
   let p1 = make_point 162 817 812 in
   let p2 = make_point 57 618 57 in
-  let d = dist p1 p2 in
+  let d = distance p1 p2 in
   Printf.printf "%d\n" (Signal.to_int d)
 
 let%expect_test "test" =
