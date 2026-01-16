@@ -4,33 +4,28 @@ open Hardcaml
 open Signal
 open Hardcaml_waveterm
 open Hardcaml_circuits
-
-let width = 18
-
-let distance p1 p2 =
-  let unpack p =
-    let z = select p (width - 1) 0 in
-    let y = select p ((2 * width) - 1) width in
-    let x = select p ((3 * width) - 1) (2 * width) in
-    (x, y, z)
-  in
-  let x1, y1, z1 = unpack p1 in
-  let x2, y2, z2 = unpack p2 in
-  let dx = sresize (x1 -: x2) (2 * width) in
-  let dy = sresize (y1 -: y2) (2 * width) in
-  let dz = sresize (z1 -: z2) (2 * width) in
-  (dx *: dx) +: (dy *: dy) +: (dz *: dz)
-
-let prng component seed =
-  let lfsr state = Lfsr.create (module Signal) state in
-  let s1 = lfsr component in
-  let s2 = lfsr seed in
-  Signal.to_bool (s1 ^: s2)
+open Hardcaml
+open Hardcaml.Signal
 
 module MinimumSpanningTree = struct
-  let lg_nodes = 10
   let nodes = 1000
-  (* let mem_depth = 1000 *)
+  let lg_nodes = 10
+  let width = 18
+
+  let dist spec p1 p2 =
+    let unpack p =
+      ( select p ((3 * width) - 1) (2 * width),
+        select p ((2 * width) - 1) width,
+        select p (width - 1) 0 )
+    in
+    let x1, y1, z1 = unpack p1 in
+    let x2, y2, z2 = unpack p2 in
+    let dx, dy, dz =
+      (reg spec (x1 -: x2), reg spec (y1 -: y2), reg spec (z1 -: z2))
+    in
+    let sq x = reg spec (sresize (x *: x) (2 * width)) in
+    let dx2, dy2, dz2 = (sq dx, sq dy, sq dz) in
+    reg spec (dx2 +: dy2 +: dz2)
 
   module I = struct
     type 'a t = {
@@ -51,132 +46,267 @@ module MinimumSpanningTree = struct
       mem2_waddr : 'a; [@bits lg_nodes]
       mem2_wdata : 'a; [@bits 3 * width]
       mem2_we : 'a;
+      finished : 'a;
     }
     [@@deriving sexp_of, hardcaml]
   end
 
+  module State = struct
+    type t = IDLE | LOAD | FIND_NEAREST | REDUCE | CONTRACT | WRITE_OUT | DONE
+    [@@deriving enumerate, sexp_of, compare]
+  end
+
+  let is_star_center spec component_id seed =
+    let lfsr_val state =
+      Lfsr.create ~config:Lfsr.Config.Galois (module Signal) state
+    in
+    let state = reg spec ~enable:vdd (lfsr_val (component_id ^: seed)) in
+    msb state
+
   let create (inputs : _ I.t) =
-    (* TODO: change these to reg_fb and have the proper control signals *)
-    let clk = inputs.clk in
-    let clr = inputs.clr in
-    let spec = Reg_spec.create ~clear:clr ~clock:clk () in
-    let seed = reg_fb spec ~enable:vdd ~width ~f:(fun x -> x +:. 1) in
+    let open Always in
+    let spec = Reg_spec.create ~clear:inputs.clr ~clock:inputs.clk () in
+    let sm = State_machine.create (module State) spec in
 
-    let start = inputs.input_done &: ~:clr in
-    let c_spec = Reg_spec.create ~clear:~:start ~clock:clk () in
-    let cycles = reg_fb c_spec ~enable:vdd ~width ~f:(fun x -> x +:. 1) in
-
-    let stage0 = ~:start in
-    let stage1 = cycles <=:. nodes in
-    let stage2 = ~:stage1 &: (cycles <=:. nodes + lg_nodes) in
-    let stage3 = ~:stage1 &: ~:stage2 in
-
-    (* stage 0:  *)
+    let current_ids =
+      Array.init nodes ~f:(fun _ -> Variable.reg spec ~width:lg_nodes)
+    in
     let positions =
-      Array.init nodes ~f:(fun idx ->
-          let enable = stage0 &: (inputs.mem_raddr ==:. idx) in
-          Signal.reg spec ~enable inputs.mem_rdata)
+      Array.init nodes ~f:(fun i ->
+          let load_enable = sm.is State.LOAD &: (inputs.mem_raddr ==:. i) in
+          Variable.reg spec ~enable:load_enable ~width:(3 * width))
+    in
+    let vertex_min_dist =
+      Array.init nodes ~f:(fun _ -> Variable.reg spec ~width:(2 * width))
+    in
+    let vertex_best_nb =
+      Array.init nodes ~f:(fun _ -> Variable.reg spec ~width:lg_nodes)
+    in
+    let seed = reg_fb spec ~enable:vdd ~width:10 ~f:(fun c -> c +:. 1) in
+
+    let cur_idx = Variable.reg spec ~width:lg_nodes in
+    let target_pos =
+      mux cur_idx.value
+        (Array.to_list (Array.map positions ~f:(fun v -> v.value)))
+    in
+    let target_id =
+      mux cur_idx.value
+        (Array.to_list (Array.map current_ids ~f:(fun v -> v.value)))
     in
 
-    (* stage 1: *)
-    let current_idx = Signal.mux2 stage0 cycles (Signal.zero lg_nodes) in
+    let pipe_valid = pipeline spec ~n:3 (sm.is FIND_NEAREST) in
+    let pipe_target_id = pipeline spec ~n:3 target_id in
+    let pipe_cur_idx = pipeline spec ~n:3 cur_idx.value in
 
-    let component_wires = Array.init nodes ~f:(fun _ -> Signal.wire lg_nodes) in
-    let components = Array.init nodes ~f:(fun idx -> component_wires.(idx)) in
+    Array.iteri positions ~f:(fun i pos ->
+        let d = dist spec pos.value target_pos in
+        let update =
+          pipe_valid
+          &: (current_ids.(i).value <>: pipe_target_id)
+          &: (d <: vertex_min_dist.(i).value)
+        in
+        let _ =
+          if_ update
+            [ vertex_min_dist.(i) <-- d; vertex_best_nb.(i) <-- pipe_cur_idx ]
+            []
+        in
+        ());
 
-    let dist_wires = Array.init nodes ~f:(fun _ -> Signal.wire (2 * width)) in
-    let distances = Array.init nodes ~f:(fun idx -> dist_wires.(idx)) in
-
-    let nearest =
-      Array.init nodes ~f:(fun idx ->
-          let cur_idx = Signal.to_int current_idx in
-          let outgoing = components.(idx) <>: components.(cur_idx) in
-          let dist = distance positions.(idx) positions.(cur_idx) in
-          let shorter = dist <: distances.(idx) in
-          let enable = stage1 &: outgoing &: shorter in
-
-          let uninit = dist_wires.(idx) <>:. 0 in
-          let new_dist = mux2 (uninit |: enable) dist_wires.(idx) dist in
-          Signal.assign dist_wires.(idx) new_dist;
-
-          Signal.reg spec ~enable current_idx)
+    let shuffle_stages_dist =
+      Array.make_matrix ~dimx:(lg_nodes + 1) ~dimy:nodes (zero (2 * width))
+    in
+    let shuffle_stages_nb =
+      Array.make_matrix ~dimx:(lg_nodes + 1) ~dimy:nodes (zero lg_nodes)
     in
 
-    (* stage 2: *)
-    let reduced =
-      let combine prev i j =
-        let same_component = components.(i) ==: components.(j) in
-        let smaller = distances.(j) <: distances.(i) in
-        Signal.mux2 (smaller &: same_component) prev.(i) prev.(j)
-      in
-      let rec loop stage prev =
-        if stage = lg_nodes then prev
-        else
-          let stride = 1 lsl stage in
-          let next =
-            Array.init nodes ~f:(fun i ->
-                let j = (i + stride) % nodes in
-                let combined = combine prev i j in
-                Signal.reg spec combined)
+    for i = 0 to nodes - 1 do
+      shuffle_stages_dist.(0).(i) <- vertex_min_dist.(i).value;
+      shuffle_stages_nb.(0).(i) <- vertex_best_nb.(i).value
+    done;
+
+    for k = 0 to lg_nodes - 1 do
+      let stride = 1 lsl k in
+      for i = 0 to nodes - 1 do
+        let j = (i + stride) mod nodes in
+        let neighbor_dist = shuffle_stages_dist.(k).(j) in
+        let neighbor_nb = shuffle_stages_nb.(k).(j) in
+        let neighbor_id = current_ids.(j).value in
+        let update =
+          sm.is REDUCE
+          &: (current_ids.(i).value ==: neighbor_id)
+          &: (neighbor_dist <: shuffle_stages_dist.(k).(i))
+        in
+        shuffle_stages_dist.(k + 1).(i) <-
+          reg spec (mux2 update neighbor_dist shuffle_stages_dist.(k).(i));
+        shuffle_stages_nb.(k + 1).(i) <-
+          reg spec (mux2 update neighbor_nb shuffle_stages_nb.(k).(i))
+      done
+    done;
+
+    let edge_valid =
+      Array.init nodes ~f:(fun i ->
+          let neighbor_id =
+            mux vertex_best_nb.(i).value
+              (Array.to_list (Array.map current_ids ~f:(fun v -> v.value)))
           in
-          loop (stage + 1) next
-      in
-      loop 0 nearest
+          let my_h =
+            msb
+              (reg spec
+                 (Lfsr.create
+                    (module Signal)
+                    ~config:Galois
+                    (current_ids.(i).value ^: seed)))
+          in
+          let nb_h =
+            msb
+              (reg spec
+                 (Lfsr.create
+                    (module Signal)
+                    ~config:Galois (neighbor_id ^: seed)))
+          in
+          let can_contract =
+            my_h ==: gnd &: (nb_h ==: vdd)
+            &: (vertex_min_dist.(i).value <>: ones (2 * width))
+          in
+          let _ =
+            if_
+              (sm.is CONTRACT &: can_contract)
+              [ current_ids.(i) <-- neighbor_id ]
+              []
+          in
+          current_ids.(i).value ==:. i &: can_contract)
     in
 
-    (* stage 3: *)
-    let rec contract idx =
-      if idx = nodes then ()
-      else
-        let flip_me = prng components.(idx) seed in
-        let flip_other = prng reduced.(idx) seed in
-
-        if flip_me && not flip_other then
-          Signal.assign component_wires.(idx) reduced.(idx);
-
-        contract (idx + 1)
+    let write_offsets =
+      Prefix_sum.eval ~config:Prefix_sum.Config.Sklansky ~operator:( +: )
+        (Array.to_list (Array.map edge_valid ~f:(fun v -> uresize v lg_nodes)))
     in
-    contract 0;
 
-    (* TODO: input reading and output writing *)
-    let mem1_waddr = Signal.of_int ~width:lg_nodes 0 in
-    let mem1_wdata = Signal.of_int ~width:(3 * width) 0 in
-    let mem1_we = Signal.of_int ~width:1 0 in
-    let mem2_waddr = Signal.of_int ~width:lg_nodes 0 in
-    let mem2_wdata = Signal.of_int ~width:(3 * width) 0 in
-    let mem2_we = Signal.of_int ~width:1 0 in
+    let total_edges = Variable.reg spec ~width:lg_nodes in
+    let drain_ptr = Variable.reg spec ~width:lg_nodes in
+
+    let all_nodes_merged =
+      Pipelined_tree_reduce.create ~f:( &: ) ~enable:vdd ~arity:2 spec
+        (Array.to_list
+           (Array.map current_ids ~f:(fun id ->
+                id.value ==: current_ids.(0).value)))
+    in
+
+    compile
+      [
+        sm.switch
+          [
+            (IDLE, [ if_ inputs.input_done [ sm.set_next LOAD ] [] ]);
+            ( LOAD,
+              [
+                (* registers are listening to inputs.mem_rdata distributedly *)
+                if_ inputs.input_done
+                  [ sm.set_next FIND_NEAREST; cur_idx <--. 0 ]
+                  [];
+              ] );
+            ( FIND_NEAREST,
+              [
+                if_
+                  (cur_idx.value ==:. nodes - 1)
+                  [ sm.set_next REDUCE; cur_idx <--. 0 ]
+                  [ cur_idx <-- cur_idx.value +:. 1 ];
+              ] );
+            ( REDUCE,
+              [
+                if_
+                  (cur_idx.value ==:. lg_nodes)
+                  [ sm.set_next CONTRACT; cur_idx <--. 0 ]
+                  [ cur_idx <-- cur_idx.value +:. 1 ];
+              ] );
+            ( CONTRACT,
+              [
+                total_edges <-- List.last_exn write_offsets;
+                sm.set_next WRITE_OUT;
+                drain_ptr <--. 0;
+              ] );
+            ( WRITE_OUT,
+              [
+                if_
+                  (drain_ptr.value ==: total_edges.value)
+                  [
+                    if_
+                      (all_nodes_merged.valid &: all_nodes_merged.value)
+                      [ sm.set_next DONE ]
+                      [ sm.set_next FIND_NEAREST; cur_idx <--. 0 ];
+                  ]
+                  [ drain_ptr <-- drain_ptr.value +:. 1 ];
+              ] );
+            (DONE, []);
+          ];
+      ];
+
+    let final_edges_src =
+      Array.init nodes ~f:(fun i -> of_int ~width:lg_nodes i)
+    in
+    let final_edges_dst = shuffle_stages_nb.(lg_nodes) in
+
     {
-      O.mem1_waddr;
-      O.mem1_wdata;
-      O.mem1_we;
-      O.mem2_waddr;
-      O.mem2_wdata;
-      O.mem2_we;
+      O.mem1_waddr = drain_ptr.value;
+      O.mem1_we = sm.is WRITE_OUT &: (total_edges.value >: zero lg_nodes);
+      O.mem1_wdata =
+        mux drain_ptr.value
+          (Array.to_list (Array.map final_edges_src ~f:(fun s -> s)));
+      O.mem2_waddr = drain_ptr.value;
+      O.mem2_we = sm.is WRITE_OUT &: (total_edges.value >: zero lg_nodes);
+      O.mem2_wdata =
+        mux drain_ptr.value
+          (Array.to_list (Array.map final_edges_dst ~f:(fun d -> d)));
+      O.finished = sm.is DONE;
     }
 end
 
-let%expect_test "l2 dist" =
-  let make_point x y z =
-    let p = x + Int.shift_left y width + Int.shift_left z (2 * width) in
-    Signal.of_int ~width:(3 * width) p
+let%expect_test "MST simulation" =
+  let module Sim =
+    Cyclesim.With_interface (MinimumSpanningTree.I) (MinimumSpanningTree.O)
   in
-  let p1 = make_point 162 817 812 in
-  let p2 = make_point 57 618 57 in
-  let d = distance p1 p2 in
-  Printf.printf "%d\n" (Signal.to_int d)
+  let sim = Sim.create MinimumSpanningTree.create in
+  let inputs, outputs = (Cyclesim.inputs sim, Cyclesim.outputs sim) in
 
-let%expect_test "test" =
-  let testbench () =
-    let module Sim =
-      Cyclesim.With_interface (MinimumSpanningTree.I) (MinimumSpanningTree.O)
-    in
-    let sim = Sim.create MinimumSpanningTree.create in
-
-    let inputs = Cyclesim.inputs sim in
-    inputs.clk := Bits.vdd;
-    inputs.clr := Bits.vdd;
-    inputs.input_done := Bits.vdd;
-    inputs.mem_rdata := Bits.zero (3 * width)
-    (* Printf.printf "%d\n" (Bits.to_int !(inputs.clk)) *)
+  let read_coords filename =
+    In_channel.read_lines filename
+    |> List.map ~f:(fun line ->
+        let parts = String.split line ~on:',' |> List.map ~f:Int.of_string in
+        match parts with
+        | [ x; y; z ] ->
+            let open Int64 in
+            (of_int x lsl 36) + (of_int y lsl 18) + of_int z
+        | _ -> failwith "Invalid format")
   in
-  testbench ()
+
+  let coords = read_coords "sample.in" in
+
+  Cyclesim.reset sim;
+  inputs.clr := Bits.vdd;
+  Cyclesim.cycle sim;
+  inputs.clr := Bits.gnd;
+
+  List.iteri coords ~f:(fun i coord ->
+      inputs.mem_raddr := Bits.of_int ~width:10 i;
+      inputs.mem_rdata := Bits.of_int64 ~width:54 coord;
+      Cyclesim.cycle sim);
+  inputs.input_done := Bits.vdd;
+  Cyclesim.cycle sim;
+  inputs.input_done := Bits.gnd;
+
+  let captured_edges = ref [] in
+
+  let finished = Bits.to_bool !(outputs.finished) in
+  while not finished do
+    Cyclesim.cycle sim;
+
+    if Bits.is_vdd !(outputs.mem1_we) then begin
+      let src = Bits.to_int !(outputs.mem1_wdata) in
+      let dst = Bits.to_int !(outputs.mem2_wdata) in
+      captured_edges := (src, dst) :: !captured_edges
+    end
+  done;
+
+  printf "MST Edges Found:\n";
+  List.rev !captured_edges
+  |> List.sort ~compare:[%compare: int * int]
+  |> List.iter ~f:(fun (u, v) -> printf "  Edge: %d -> %d\n" u v)
