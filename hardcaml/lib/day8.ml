@@ -2,7 +2,6 @@ open Core
 open Base
 open Hardcaml
 open Signal
-open Hardcaml_circuits
 
 module Part1 = struct
   let width = 18

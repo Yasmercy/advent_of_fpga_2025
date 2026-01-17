@@ -1,2 +1,11 @@
 (test
+ (libraries base core hardcaml day8)
+ (deps "../../data/sample.in")
+ (preprocess
+  (pps ppx_hardcaml ppx_jane))
  (name test_day8))
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -A))))
