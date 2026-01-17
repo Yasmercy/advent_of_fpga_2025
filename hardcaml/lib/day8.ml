@@ -1,4 +1,3 @@
-open Core
 open Base
 open Hardcaml
 open Signal
@@ -7,10 +6,10 @@ module Part1 = struct
   let width = 18
   let dist_width = 2 * width
   let point_width = 3 * width
-  let lg_n = 10
-  let nodes = 1000
-  let lg_m = 10
-  let edges = 1000
+  let lg_n = 5
+  let nodes = 20
+  let lg_m = 4
+  let edges = 10
   let output_width = 3 * lg_n
 
   module I = struct
@@ -29,6 +28,8 @@ module Part1 = struct
     [@@deriving sexp_of, hardcaml]
   end
 
+  let ( ++ ) x = x +:. 1
+
   module Dist = struct
     module I = struct
       type 'a t = { clk : 'a; clr : 'a; start : 'a; v1 : 'a; v2 : 'a }
@@ -45,7 +46,7 @@ module Part1 = struct
       (* delay propagation counter *)
       let count =
         reg_fb spec ~width:3 ~f:(fun c ->
-            mux2 inputs.start (Signal.zero 3) (c +:. 1))
+            mux2 inputs.start (Signal.zero 3) (( ++ ) c))
       in
 
       let unpack v =
@@ -82,7 +83,7 @@ module Part1 = struct
     let incr = Signal.wire 1 in
     let start = Signal.wire 1 in
 
-    let cur_idx = reg_fb ~enable:incr spec ~width:lg_n ~f:(fun x -> x +:. 1) in
+    let cur_idx = reg_fb ~enable:incr spec ~width:lg_n ~f:( ++ ) in
     let cur_pos = mux cur_idx (Array.to_list positions) in
 
     let dists_to_cur =
@@ -162,7 +163,7 @@ module Part1 = struct
       let enable = Signal.wire 1 in
       let start = Signal.wire 1 in
 
-      let cur_idx = reg_fb ~enable spec ~width:lg_n ~f:(fun x -> x +:. 1) in
+      let cur_idx = reg_fb ~enable spec ~width:lg_n ~f:( ++ ) in
       let cur_pos = mux cur_idx (Array.to_list inputs.positions) in
       let last = cur_idx ==:. nodes - 1 in
 
@@ -277,65 +278,84 @@ module Part1 = struct
           reg spec ~enable inputs.mem_rdata)
     in
 
+    let edge_enable = Signal.wire 1 in
+    let edge_start = Signal.wire 1 in
+    let merged_done = Signal.wire 1 in
+
+    let edge_phase_active = inputs.input_done &: ~:merged_done in
+    let cur_edge_idx = reg_fb ~enable:edge_enable spec ~width:lg_m ~f:( ++ ) in
+    let is_last_edge = cur_edge_idx ==:. edges - 1 in
+    merged_done <== reg spec (is_last_edge &: edge_enable);
+
+    let threshold = Signal.wire dist_width in
+    let edge =
+      MinEdge.create { clk; clr; start = edge_start; threshold; positions }
+    in
+    let threshold_reg =
+      reg_fb spec ~width:dist_width ~f:(fun d -> mux2 edge_enable edge.dist d)
+    in
+
+    threshold <== threshold_reg;
+    edge_enable <== (edge.finished &: edge_phase_active);
+
+    let trigger_first_edge =
+      inputs.input_done &: ~:(reg spec inputs.input_done)
+    in
+    edge_start
+    <== reg spec (trigger_first_edge |: (edge_enable &: ~:is_last_edge));
+
     let merge_from = Signal.wire lg_n in
     let merge_to = Signal.wire lg_n in
+    let merge_from_count = Signal.wire lg_n in
+    let merge_to_count = Signal.wire lg_n in
+
     let labels =
       List.init nodes ~f:(fun idx ->
           let default = Signal.of_int ~width:lg_n idx in
-          let spec =
-            Reg_spec.create ~clock:clk ~clear:clr ()
-            |> Reg_spec.override ~reset_to:default
-          in
-
-          reg_fb spec ~width:lg_n ~f:(fun d ->
-              mux2 (d ==: merge_from) merge_to d))
+          let s = Reg_spec.override spec ~reset_to:default in
+          reg_fb s ~width:lg_n ~f:(fun d ->
+              mux2 edge_enable (mux2 (d ==: merge_from) merge_to d) d))
     in
-    let merge_from_count = Signal.wire lg_n in
-    let merge_to_count = Signal.wire lg_n in
+
     let counts =
       List.init nodes ~f:(fun idx ->
-          reg_fb spec ~width:lg_n ~f:(fun d ->
-              mux2
-                (merge_from ==:. idx &: (merge_to <>:. idx))
-                (d -: merge_from_count)
-                (mux2
-                   (merge_to ==:. idx &: (merge_from <>:. idx))
-                   (d +: merge_to_count) d)))
+          let s =
+            Reg_spec.override spec ~reset_to:(Signal.of_int ~width:lg_n 1)
+          in
+          reg_fb s ~width:lg_n ~f:(fun d ->
+              let is_from = merge_from ==:. idx &: (merge_from <>: merge_to) in
+              let is_to = merge_to ==:. idx &: (merge_from <>: merge_to) in
+              mux2 edge_enable
+                (mux2 is_from (Signal.zero lg_n)
+                   (mux2 is_to (d +: merge_from_count) d))
+                d))
     in
 
-    let enable = Signal.wire 1 in
-    let start = Signal.wire 1 in
-    let cur_idx = reg_fb ~enable spec ~width:lg_m ~f:(fun x -> x +:. 1) in
-    let last = cur_idx ==:. edges - 1 in
+    let src_label = mux edge.src labels in
+    let dst_label = mux edge.dst labels in
+    merge_from <== mux2 (src_label >: dst_label) src_label dst_label;
+    merge_to <== mux2 (src_label >: dst_label) dst_label src_label;
+    merge_from_count <== mux merge_from counts;
+    merge_to_count <== mux merge_to counts;
 
-    let threshold = wire dist_width in
-    let edge = MinEdge.create { clk; clr; start; threshold; positions } in
-    let _ =
-      reg_fb ~enable:vdd spec ~width:dist_width ~f:(function d ->
-          threshold <== d;
-          enable <== edge.finished;
-          start <== reg spec (enable &: ~:last);
+    let scan_done = wire 1 in
+    let scan_enable = merged_done &: ~:scan_done in
+    let scan_idx = reg_fb ~enable:scan_enable spec ~width:lg_n ~f:( ++ ) in
+    let scan_done_r = reg spec (scan_idx ==:. nodes - 1) in
+    scan_done <== scan_done_r;
 
-          let src = mux edge.src labels in
-          let dst = mux edge.dst labels in
-          let min = mux2 (src <: dst) src dst in
-          let max = mux2 (src >=: dst) src dst in
-
-          merge_from <== mux2 enable max (Signal.zero lg_n);
-          merge_to <== mux2 enable min (Signal.zero lg_n);
-          merge_from_count <== mux merge_from counts;
-          merge_to_count <== mux merge_to counts;
-
-          mux2 enable d edge.dist)
+    let is_root = mux scan_idx labels ==: scan_idx in
+    let top3 =
+      Top3.create
+        {
+          clk;
+          clr;
+          start = scan_enable &: is_root;
+          new_count = mux scan_idx counts;
+        }
     in
-    let merged_done = cur_idx ==:. edges in
 
-    let scan_idx = reg_fb ~enable:last spec ~width:lg_n ~f:(fun x -> x +:. 1) in
-    let scan_done = scan_idx ==:. nodes in
-    let new_count = mux scan_idx counts in
-
-    let top3 = Top3.create { clk; clr; start = merged_done; new_count } in
-    let output_done = scan_done in
     let output_sol = top3.top1 *: top3.top2 *: top3.top3 in
-    { O.output_done; output_sol }
+
+    { O.output_done = scan_done; output_sol }
 end

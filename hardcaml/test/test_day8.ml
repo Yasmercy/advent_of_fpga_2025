@@ -9,16 +9,11 @@ let read_points filename =
           let parts = String.split line ~on:',' |> List.map ~f:String.strip in
           match parts with
           | [ x; y; z ] ->
-              (* Convert x, y, z to bitstrings and concatenate them *)
-              (* Assuming 18-bit widths as per your Part1 definition *)
               let to_int s = Int.of_string s in
               (to_int z lsl 36) lor (to_int y lsl 18) lor to_int x
           | _ -> failwith "Invalid CSV format"))
 
-let part1 =
-  let cwd = Stdlib.Sys.getcwd () in
-  Stdio.print_endline cwd;
-
+let _ =
   let points = read_points "../../../../data/sample.in" in
 
   let module Sim = Cyclesim.With_interface (Part1.I) (Part1.O) in
@@ -37,7 +32,6 @@ let part1 =
       inputs.mem_raddr := Bits.of_int ~width:Part1.lg_n i;
       inputs.mem_rdata := Bits.of_int ~width:Part1.point_width point_data;
       cycle ());
-
   inputs.input_done := Bits.vdd;
 
   let max_cycles = 100_000 in
