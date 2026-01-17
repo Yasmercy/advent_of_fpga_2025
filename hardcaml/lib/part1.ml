@@ -130,12 +130,104 @@ module Part1 = struct
 
     Signal.tree ~arity:2 ~f:reduce leaves
 
+  module MinEdge = struct
+    module I = struct
+      type 'a t = {
+        clk : 'a;
+        clr : 'a;
+        start_all : 'a;
+        threshold : 'a; [@bits 2 * width]
+        positions : 'a array; [@length nodes]
+      }
+      [@@deriving hardcaml]
+    end
+
+    module O = struct
+      type 'a t = {
+        src : 'a; [@bits lg_n]
+        dst : 'a; [@bits lg_n]
+        dist : 'a; [@bits 2 * width]
+        all_done : 'a;
+      }
+      [@@deriving hardcaml]
+    end
+
+    let create (inputs : _ I.t) =
+      let spec = Reg_spec.create ~clock:inputs.clk ~clear:inputs.clr () in
+
+      let enable = Signal.wire 1 in
+      let start = Signal.wire 1 in
+
+      let cur_idx = reg_fb ~enable spec ~width:lg_n ~f:(fun x -> x +:. 1) in
+      let cur_pos = mux cur_idx (Array.to_list inputs.positions) in
+      let last = cur_idx ==:. nodes - 1 in
+
+      let dists_to_cur =
+        Array.init nodes ~f:(fun idx ->
+            Dist.create ~width
+              {
+                clk = inputs.clk;
+                clr = inputs.clr;
+                start;
+                v1 = inputs.positions.(idx);
+                v2 = cur_pos;
+              })
+      in
+
+      enable <== dists_to_cur.(0).finished;
+      start <== reg spec (inputs.start_all |: (enable &: ~:last));
+
+      let dist_max = Signal.ones (2 * width) in
+      let spec_max = Reg_spec.override spec ~reset_to:dist_max in
+
+      let nearest =
+        Array.init nodes ~f:(fun src ->
+            let best_d = Signal.wire (2 * width) in
+            let cur_d = dists_to_cur.(src).dist in
+
+            let better = cur_d <: best_d &: (cur_d >: inputs.threshold) in
+            let update_en = enable &: better in
+
+            let dist = reg spec_max ~enable:update_en cur_d in
+            let dst = reg spec ~enable:update_en cur_idx in
+            let src = Signal.of_int ~width:lg_n src in
+
+            best_d <== dist;
+            (src, dst, dist))
+      in
+
+      let reduce = function
+        | [ a; b ] ->
+            let asrc, adst, adist = a in
+            let bsrc, bdst, bdist = b in
+            let a_is_closer = adist <: bdist in
+            ( mux2 a_is_closer asrc bsrc,
+              mux2 a_is_closer adst bdst,
+              mux2 a_is_closer adist bdist )
+        | [ a ] -> a
+        | _ -> failwith "Tree arity error"
+      in
+
+      let leaves = Array.to_list nearest in
+      let final_src, final_tgt, final_dist =
+        Signal.tree ~arity:2 ~f:reduce leaves
+      in
+
+      let all_done = reg spec (last &: enable) in
+      { O.src = final_src; dst = final_tgt; dist = final_dist; all_done }
+  end
+
   let create (inputs : _ I.t) =
     let clk = inputs.clk in
     let clr = inputs.clr in
     let spec = Reg_spec.create ~clear:clr ~clock:clk () in
 
-    let edges_added = wire lg_n in
+    let loading = ~:(inputs.input_done) in
+    let positions =
+      Array.init nodes ~f:(fun idx ->
+          let enable = loading &: (inputs.mem_raddr ==:. idx) in
+          Signal.reg spec ~enable inputs.mem_rdata)
+    in
 
     let output_done = Signal.gnd in
     let output_sol = Signal.zero width in
