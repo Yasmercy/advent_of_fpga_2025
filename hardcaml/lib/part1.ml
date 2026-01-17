@@ -6,22 +6,27 @@ open Hardcaml_circuits
 
 module Part1 = struct
   let width = 18
+  let dist_width = 2 * width
+  let point_width = 3 * width
   let lg_n = 10
   let nodes = 1000
+  let lg_m = 10
+  let edges = 1000
+  let output_width = 3 * lg_n
 
   module I = struct
     type 'a t = {
       clk : 'a;
       clr : 'a;
       input_done : 'a;
-      mem_rdata : 'a; [@bits 3 * width]
+      mem_rdata : 'a; [@bits point_width]
       mem_raddr : 'a; [@bits lg_n]
     }
     [@@deriving sexp_of, hardcaml]
   end
 
   module O = struct
-    type 'a t = { output_done : 'a; output_sol : 'a [@bits width] }
+    type 'a t = { output_done : 'a; output_sol : 'a [@bits output_width] }
     [@@deriving sexp_of, hardcaml]
   end
 
@@ -60,8 +65,8 @@ module Part1 = struct
       let sq = diff *+ diff |> pipeline ~n:2 spec in
       let valid = count >=:. 4 in
       let acc =
-        reg_fb spec ~width:(2 * width) ~f:(fun d ->
-            mux2 valid (Signal.zero (2 * width)) (d +: sq))
+        reg_fb spec ~width:dist_width ~f:(fun d ->
+            mux2 valid (Signal.zero dist_width) (d +: sq))
       in
 
       (* cycles/dimension = 1(diff) + 2(sq) + 1(acc) = 4
@@ -90,7 +95,7 @@ module Part1 = struct
     incr <== dists_to_cur.(0).finished;
     start <== reg spec (clr |: incr);
 
-    let dist_max = Signal.ones (2 * width) in
+    let dist_max = Signal.ones dist_width in
     let spec_max =
       Reg_spec.create ~clock:clk ~clear:clr ()
       |> Reg_spec.override ~reset_to:dist_max
@@ -98,7 +103,7 @@ module Part1 = struct
 
     let nearest =
       Array.init nodes ~f:(fun idx ->
-          let best_dist = Signal.wire (2 * width) in
+          let best_dist = Signal.wire dist_width in
           let cur_dist = dists_to_cur.(idx).dist in
 
           let better = cur_dist <: best_dist &: cur_dist >: threshold in
@@ -135,8 +140,8 @@ module Part1 = struct
       type 'a t = {
         clk : 'a;
         clr : 'a;
-        start_all : 'a;
-        threshold : 'a; [@bits 2 * width]
+        start : 'a;
+        threshold : 'a; [@bits dist_width]
         positions : 'a array; [@length nodes]
       }
       [@@deriving hardcaml]
@@ -146,8 +151,8 @@ module Part1 = struct
       type 'a t = {
         src : 'a; [@bits lg_n]
         dst : 'a; [@bits lg_n]
-        dist : 'a; [@bits 2 * width]
-        all_done : 'a;
+        dist : 'a; [@bits dist_width]
+        finished : 'a;
       }
       [@@deriving hardcaml]
     end
@@ -175,14 +180,14 @@ module Part1 = struct
       in
 
       enable <== dists_to_cur.(0).finished;
-      start <== reg spec (inputs.start_all |: (enable &: ~:last));
+      start <== reg spec (inputs.start |: (enable &: ~:last));
 
-      let dist_max = Signal.ones (2 * width) in
+      let dist_max = Signal.ones dist_width in
       let spec_max = Reg_spec.override spec ~reset_to:dist_max in
 
       let nearest =
         Array.init nodes ~f:(fun src ->
-            let best_d = Signal.wire (2 * width) in
+            let best_d = Signal.wire dist_width in
             let cur_d = dists_to_cur.(src).dist in
 
             let better = cur_d <: best_d &: (cur_d >: inputs.threshold) in
@@ -196,6 +201,7 @@ module Part1 = struct
             (src, dst, dist))
       in
 
+      (* argmin by distance *)
       let reduce = function
         | [ a; b ] ->
             let asrc, adst, adist = a in
@@ -213,8 +219,51 @@ module Part1 = struct
         Signal.tree ~arity:2 ~f:reduce leaves
       in
 
-      let all_done = reg spec (last &: enable) in
-      { O.src = final_src; dst = final_tgt; dist = final_dist; all_done }
+      let finished = reg spec (last &: enable) in
+      { O.src = final_src; dst = final_tgt; dist = final_dist; finished }
+  end
+
+  module Top3 = struct
+    module I = struct
+      type 'a t = {
+        clk : 'a;
+        clr : 'a;
+        start : 'a;
+        new_count : 'a; [@bits lg_n]
+      }
+      [@@deriving hardcaml]
+    end
+
+    module O = struct
+      type 'a t = {
+        top1 : 'a; [@bits lg_n]
+        top2 : 'a; [@bits lg_n]
+        top3 : 'a; [@bits lg_n]
+      }
+      [@@deriving hardcaml]
+    end
+
+    let create (inputs : _ I.t) =
+      let spec = Reg_spec.create ~clock:inputs.clk ~clear:inputs.clr () in
+
+      let top1 = Signal.wire lg_n in
+      let top2 = Signal.wire lg_n in
+      let top3 = Signal.wire lg_n in
+
+      let c = inputs.new_count in
+      let gt1 = c >: top1 in
+      let gt2 = c >: top2 in
+      let gt3 = c >: top3 in
+
+      let next_r1 = mux2 gt1 c top1 in
+      let next_r2 = mux2 gt1 top1 (mux2 gt2 c top2) in
+      let next_r3 = mux2 gt1 top2 (mux2 gt2 top1 (mux2 gt3 c top3)) in
+
+      top1 <== reg ~enable:inputs.start spec next_r1;
+      top2 <== reg ~enable:inputs.start spec next_r2;
+      top3 <== reg ~enable:inputs.start spec next_r3;
+
+      { O.top1; top2; top3 }
   end
 
   let create (inputs : _ I.t) =
@@ -226,10 +275,68 @@ module Part1 = struct
     let positions =
       Array.init nodes ~f:(fun idx ->
           let enable = loading &: (inputs.mem_raddr ==:. idx) in
-          Signal.reg spec ~enable inputs.mem_rdata)
+          reg spec ~enable inputs.mem_rdata)
     in
 
-    let output_done = Signal.gnd in
-    let output_sol = Signal.zero width in
-    { O.output_done; O.output_sol }
+    let merge_from = Signal.wire lg_n in
+    let merge_to = Signal.wire lg_n in
+    let labels =
+      List.init nodes ~f:(fun idx ->
+          let default = Signal.of_int ~width:lg_n idx in
+          let spec =
+            Reg_spec.create ~clock:clk ~clear:clr ()
+            |> Reg_spec.override ~reset_to:default
+          in
+
+          reg_fb spec ~width:lg_n ~f:(fun d ->
+              mux2 (d ==: merge_from) merge_to d))
+    in
+    let merge_from_count = Signal.wire lg_n in
+    let merge_to_count = Signal.wire lg_n in
+    let counts =
+      List.init nodes ~f:(fun idx ->
+          reg_fb spec ~width:lg_n ~f:(fun d ->
+              mux2
+                (merge_from ==:. idx &: (merge_to <>:. idx))
+                (d -: merge_from_count)
+                (mux2
+                   (merge_to ==:. idx &: (merge_from <>:. idx))
+                   (d +: merge_to_count) d)))
+    in
+
+    let enable = Signal.wire 1 in
+    let start = Signal.wire 1 in
+    let cur_idx = reg_fb ~enable spec ~width:lg_m ~f:(fun x -> x +:. 1) in
+    let last = cur_idx ==:. edges - 1 in
+
+    let threshold = wire dist_width in
+    let edge = MinEdge.create { clk; clr; start; threshold; positions } in
+    let _ =
+      reg_fb ~enable:vdd spec ~width:dist_width ~f:(function d ->
+          threshold <== d;
+          enable <== edge.finished;
+          start <== reg spec (enable &: ~:last);
+
+          let src = mux edge.src labels in
+          let dst = mux edge.dst labels in
+          let min = mux2 (src <: dst) src dst in
+          let max = mux2 (src >=: dst) src dst in
+
+          merge_from <== mux2 enable max (Signal.zero lg_n);
+          merge_to <== mux2 enable min (Signal.zero lg_n);
+          merge_from_count <== mux merge_from counts;
+          merge_to_count <== mux merge_to counts;
+
+          mux2 enable d edge.dist)
+    in
+    let merged_done = cur_idx ==:. edges in
+
+    let scan_idx = reg_fb ~enable:last spec ~width:lg_n ~f:(fun x -> x +:. 1) in
+    let scan_done = scan_idx ==:. nodes in
+    let new_count = mux scan_idx counts in
+
+    let top3 = Top3.create { clk; clr; start = merged_done; new_count } in
+    let output_done = scan_done in
+    let output_sol = top3.top1 *: top3.top2 *: top3.top3 in
+    { O.output_done; output_sol }
 end
